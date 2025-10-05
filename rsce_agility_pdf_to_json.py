@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import requests
 import pdfplumber
-
+import subprocess, shlex, os, certifi
 # ----------------- Config -----------------
 URLS = {
     "2025": "https://www.rsce.es/wp-content/uploads/2025/09/Resultados_Agility_2025.pdf",
@@ -72,30 +72,86 @@ TABLE_SETTINGS_LINES = {
 }
 
 # ----------------- Utilidades -----------------
+
+
 def dload(url: str, dst: Path):
-    """Descarga validando que realmente es un PDF."""
+    """
+    Descarga validando que realmente es un PDF.
+    Secuencia de fallbacks:
+      1) requests (verify=True)
+      2) requests (verify=certifi.where())
+      3) curl --cacert <certifi>
+      4) (opcional) si ALLOW_INSECURE_SSL=true → curl --insecure / requests verify=False
+    """
     need = (not dst.exists()) or (dst.stat().st_size < 1024)
     if not need:
         return
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (RSCE-Agility-Scraper/1.0; +https://agilitydivertidog.com)"
-    }
-    r = requests.get(url, timeout=60, headers=headers, allow_redirects=True)
-    r.raise_for_status()
+    UA = "Mozilla/5.0 (RSCE-Agility-Scraper/1.0)"
+    cert_path = certifi.where()
+    allow_insecure = os.environ.get("ALLOW_INSECURE_SSL", "").lower() in {"1","true","yes"}
 
-    # Validación de tipo
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    # Algunos servidores sirven 'application/octet-stream'; validamos por firma %PDF
-    content = r.content
-    if not content.startswith(b"%PDF"):
-        # si el content-type tampoco es claramente PDF, error
-        if "pdf" not in ctype:
-            raise ValueError(f"Respuesta no es PDF (Content-Type={ctype}). URL: {url}")
+    def _validate_pdf(bytes_or_path):
+        if isinstance(bytes_or_path, (bytes, bytearray)):
+            return bytes_or_path.startswith(b"%PDF")
+        p = Path(bytes_or_path)
+        return p.exists() and p.stat().st_size > 1024 and p.read_bytes().startswith(b"%PDF")
 
-    dst.write_bytes(content)
-    if dst.stat().st_size < 1024:
-        raise ValueError(f"PDF muy pequeño: {dst}")
+    # 1) requests normal
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
+        r.raise_for_status()
+        if not _validate_pdf(r.content):
+            raise ValueError(f"Respuesta no es PDF (CT={r.headers.get('Content-Type')})")
+        dst.write_bytes(r.content)
+        return
+    except Exception as e1:
+        print(f"[dload] requests verify=True falló: {e1}")
+
+    # 2) requests con certifi.where() explícito
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=60, verify=cert_path)
+        r.raise_for_status()
+        if not _validate_pdf(r.content):
+            raise ValueError(f"Respuesta no es PDF (CT={r.headers.get('Content-Type')})")
+        dst.write_bytes(r.content)
+        return
+    except Exception as e2:
+        print(f"[dload] requests verify=certifi.where() falló: {e2}")
+
+    # 3) curl con --cacert
+    try:
+        cmd = f'curl --fail --location --silent --show-error --user-agent "{UA}" --cacert "{cert_path}" --output "{dst}" "{url}"'
+        print(f"[dload] {cmd}")
+        subprocess.run(shlex.split(cmd), check=True)
+        if not _validate_pdf(dst):
+            raise ValueError("curl --cacert descargó algo que no es PDF")
+        return
+    except Exception as e3:
+        print(f"[dload] curl --cacert falló: {e3}")
+
+    # 4) *Opcional* inseguro (si lo permites por env)
+    if allow_insecure:
+        try:
+            cmd = f'curl --fail --location --silent --show-error --insecure --user-agent "{UA}" --output "{dst}" "{url}"'
+            print(f"[dload] ⚠️ usando --insecure por ALLOW_INSECURE_SSL=true")
+            subprocess.run(shlex.split(cmd), check=True)
+            if not _validate_pdf(dst):
+                raise ValueError("curl --insecure descargó algo que no es PDF")
+            return
+        except Exception as e4:
+            print(f"[dload] curl --insecure falló: {e4}")
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=60, verify=False)
+            r.raise_for_status()
+            if not _validate_pdf(r.content):
+                raise ValueError(f"Respuesta no es PDF (CT={r.headers.get('Content-Type')})")
+            dst.write_bytes(r.content)
+            return
+        except Exception as e5:
+            print(f"[dload] requests verify=False falló: {e5}")
+
+    raise RuntimeError(f"No se pudo descargar PDF de {url} con ningún método")
 
 def norm_ws(x: Any) -> Any:
     if isinstance(x, str):
