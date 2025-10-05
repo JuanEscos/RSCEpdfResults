@@ -1,0 +1,121 @@
+name: RSCE Resultados diarios (PDF→JSON + FTPS)
+
+on:
+  schedule:
+    - cron: '10 4 * * *'   # 04:10 UTC todos los días
+  workflow_dispatch: {}
+
+jobs:
+  run-and-upload:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Madrid
+      PY_SCRIPT: rsce_agility_pdf_to_json.py
+      OUT_DIR: data/agility/processed
+      FILE_PATTERN: 'resultados_*.json'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run scraper (PDF → JSON por año)
+        run: |
+          set -euo pipefail
+          python "$PY_SCRIPT"
+
+      - name: Collect outputs and build hashes
+        id: collect
+        run: |
+          set -euo pipefail
+          test -d "$OUT_DIR" || { echo "No existe $OUT_DIR"; exit 1; }
+          mapfile -t FILES < <(find "$OUT_DIR" -type f -name "$FILE_PATTERN" | sort)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No hay JSONs que subir"; exit 1
+          fi
+          printf "%s\n" "${FILES[@]}" > local_files.txt
+          : > local_hashes.txt
+          for f in "${FILES[@]}"; do
+            sha256sum "$f" >> local_hashes.txt
+          done
+          echo "count=${#FILES[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Listar carpeta remota antes de subir
+        env:
+          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}   # ej: /www/NewWeb/Privado
+        run: |
+          set -euo pipefail
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
+          # Sólo listar; no fallar si no existe aún
+          curl --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
+
+      - name: Subir JSONs por FTPS (TLS explícito en 21)
+        env:
+          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            NAME="$(basename "$f")"
+            echo "→ Subiendo $NAME"
+            curl --fail --ssl-reqd --ftp-create-dirs --disable-epsv --ftp-skip-pasv-ip \
+                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+                 --upload-file "$f" \
+                 "${BASE}/${NAME}"
+          done < local_files.txt
+
+      - name: Verificar subidas (descarga y compara hash)
+        env:
+          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
+          : > remote_hashes.txt
+
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            NAME="$(basename "$f")"
+            echo "← Descargando $NAME para verificar"
+            curl --fail --ssl-reqd --disable-epsv --ftp-skip-pasv-ip \
+                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+                 --output "remote_${NAME}" \
+                 "${BASE}/${NAME}"
+            sha256sum "remote_${NAME}" >> remote_hashes.txt
+          done < local_files.txt
+
+          # Comparar listas de hashes (ordenadas por el mismo sort previo)
+          diff -q <(awk '{print $1}' local_hashes.txt) <(awk '{print $1}' remote_hashes.txt)
+          echo "✔ Hash de todos los JSONs OK"
+
+      - name: Publicar artefacto (opcional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-rsce
+          path: |
+            ${{ env.OUT_DIR }}/resultados_*.json
+            local_hashes.txt
+            remote_*.json
+          if-no-files-found: ignore
