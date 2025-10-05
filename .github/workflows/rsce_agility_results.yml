@@ -2,7 +2,7 @@ name: RSCE Resultados diarios (PDF→JSON + FTPS)
 
 on:
   schedule:
-    - cron: '10 4 * * *'   # 04:10 UTC todos los días
+    - cron: '10 4 * * *'   # 04:10 UTC
   workflow_dispatch: {}
 
 jobs:
@@ -13,10 +13,19 @@ jobs:
       PY_SCRIPT: rsce_agility_pdf_to_json.py
       OUT_DIR: data/agility/processed
       FILE_PATTERN: 'resultados_*.json'
+      # Cambia a 'true' SOLO si el servidor sigue fallando con la cadena TLS
+      ALLOW_INSECURE_SSL: 'false'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Refresh CA certificates
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
+          sudo update-ca-certificates
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -29,7 +38,12 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
+          # Asegura certifi disponible para el script
+          python - << 'PY'
+          import certifi, sys
+          print("certifi.where() =", certifi.where(), file=sys.stderr)
+          PY
 
       - name: Run scraper (PDF → JSON por año)
         run: |
@@ -57,11 +71,10 @@ jobs:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}   # ej: /www/NewWeb/Privado
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
           BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
-          # Sólo listar; no fallar si no existe aún
           curl --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
 
       - name: Subir JSONs por FTPS (TLS explícito en 21)
@@ -93,7 +106,6 @@ jobs:
           set -euo pipefail
           BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
           : > remote_hashes.txt
-
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             NAME="$(basename "$f")"
@@ -104,18 +116,5 @@ jobs:
                  "${BASE}/${NAME}"
             sha256sum "remote_${NAME}" >> remote_hashes.txt
           done < local_files.txt
-
-          # Comparar listas de hashes (ordenadas por el mismo sort previo)
           diff -q <(awk '{print $1}' local_hashes.txt) <(awk '{print $1}' remote_hashes.txt)
           echo "✔ Hash de todos los JSONs OK"
-
-      - name: Publicar artefacto (opcional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: json-rsce
-          path: |
-            ${{ env.OUT_DIR }}/resultados_*.json
-            local_hashes.txt
-            remote_*.json
-          if-no-files-found: ignore
