@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-RSCE Agility → PDFs a JSON por año (con ORGANIZADOR/LUGAR/FECHA robustos)
-- Detecta 'ENTIDAD ORGANIZADORA/ORGANIZADOR/ORGANIZADORAS' con o sin ':'
-- Si el valor no está en la misma línea, toma la siguiente (si no es LUGAR/FECHA)
-- Fallback por palabras (extract_words) para casos solapados
-- Evita NaN en JSON (usa null)
-- Empareja AGILITY/JUMPING → (AGI_PEN/AGI_VEL, JMP_PEN/JMP_VEL)
-- Elimina columnas Col_* totalmente vacías
+RSCE Agility → PDFs a JSON por año (robusto en descarga y extracción)
+- Descarga con User-Agent y valida PDF (%PDF y Content-Type)
+- Dos pasadas de extracción: lines + auto
+- Propaga ORGANIZADOR/LUGAR/FECHA por página
+- JSON estricto (sin NaN), limpia columnas vacías Col_*
 """
 
 import re
@@ -60,14 +58,42 @@ FINAL_ORDER = [
     "ELIM_AGI", "ELIM_JMP"
 ]
 
+TABLE_SETTINGS_LINES = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+    "intersection_tolerance": 5,
+    "snap_tolerance": 3,
+    "join_tolerance": 3,
+    "edge_min_length": 20,
+    "min_words_vertical": 1,
+    "min_words_horizontal": 1,
+    "keep_blank_chars": False,
+    "text_tolerance": 2,
+}
+
 # ----------------- Utilidades -----------------
 def dload(url: str, dst: Path):
-    """Descarga el PDF si no existe (o si es sospechosamente pequeño)."""
-    if dst.exists() and dst.stat().st_size > 1024:
+    """Descarga validando que realmente es un PDF."""
+    need = (not dst.exists()) or (dst.stat().st_size < 1024)
+    if not need:
         return
-    r = requests.get(url, timeout=60)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (RSCE-Agility-Scraper/1.0; +https://agilitydivertidog.com)"
+    }
+    r = requests.get(url, timeout=60, headers=headers, allow_redirects=True)
     r.raise_for_status()
-    dst.write_bytes(r.content)
+
+    # Validación de tipo
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    # Algunos servidores sirven 'application/octet-stream'; validamos por firma %PDF
+    content = r.content
+    if not content.startswith(b"%PDF"):
+        # si el content-type tampoco es claramente PDF, error
+        if "pdf" not in ctype:
+            raise ValueError(f"Respuesta no es PDF (Content-Type={ctype}). URL: {url}")
+
+    dst.write_bytes(content)
     if dst.stat().st_size < 1024:
         raise ValueError(f"PDF muy pequeño: {dst}")
 
@@ -77,7 +103,6 @@ def norm_ws(x: Any) -> Any:
     return x
 
 def is_header_row(row: List[Any]) -> bool:
-    """Solo considera cabecera si hay varias palabras clave típicas."""
     txt = " ".join([str(x or "").lower() for x in row])
     hits = sum(1 for t in HEADER_TOKENS if t in txt)
     return hits >= 3
@@ -106,7 +131,6 @@ def canon_headers(cols: List[str]) -> List[str]:
     return make_unique(out)
 
 def spanish_num(x):
-    """Convierte '0,00'→0.0; 'Elim.'→None; deja strings no numéricas tal cual."""
     if x is None:
         return None
     if isinstance(x, (int, float)) and not pd.isna(x):
@@ -125,7 +149,6 @@ def spanish_num(x):
     return s
 
 def detect_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """Renombra columnas de penalización/velocidad para AGILITY y JUMPING."""
     df = df.copy()
     cols = list(df.columns)
 
@@ -168,7 +191,6 @@ def detect_scores(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def clean_table(raw: List[List[Any]]) -> pd.DataFrame:
-    """Convierte tabla cruda en DF; no promociona cabecera salvo que encaje con tokens."""
     if not raw:
         return pd.DataFrame()
     rows = [[norm_ws(c) for c in r] for r in raw]
@@ -207,53 +229,34 @@ def clean_table(raw: List[List[Any]]) -> pd.DataFrame:
     df = df[[c for c in FINAL_ORDER if c in df.columns] + [c for c in df.columns if c not in FINAL_ORDER]]
     return df.reset_index(drop=True)
 
-# -------- Cabeceras de página: texto + fallback por palabras --------
+# -------- Cabeceras de página --------
 def parse_header_text_lines(lines: List[str]) -> Dict[str, Any]:
-    """
-    Busca ORGANIZADOR/A/AS, LUGAR y FECHA analizando líneas ya normalizadas.
-    Si 'ENTIDAD ORGANIZADOR(A)(AS)' no trae valor, usa la siguiente línea no vacía
-    que no empiece por LUGAR/FECHA.
-    """
     org = lugar = fecha_raw = None
-    # índice de la línea con 'ENTIDAD ORGANIZADOR...' (singular/plural; con o sin ':')
     idx = -1
     for i, ln in enumerate(lines):
         if re.search(r"ENTIDAD\s+ORGANIZADOR(?:A|AS)?\b", ln, flags=re.I):
             idx = i
-            # ¿trae valor en la misma línea?
             m = re.search(r"ENTIDAD\s+ORGANIZADOR(?:A|AS)?[:\s]*(.*)$", ln, flags=re.I)
             if m and m.group(1).strip():
                 org = m.group(1).strip()
             break
-
-    # si no hay valor claro, prueba con la siguiente línea si no es LUGAR/FECHA
     if org is None and idx >= 0 and idx + 1 < len(lines):
         nxt = lines[idx + 1].strip()
         if not re.match(r"^(LUGAR|FECHA)\b", nxt, flags=re.I):
             org = nxt
-
-    # LUGAR:
     for ln in lines:
         m = re.search(r"^LUGAR[:\s]+(.+)$", ln, flags=re.I)
         if m:
-            lugar = m.group(1).strip()
-            break
-
-    # FECHA:
+            lugar = m.group(1).strip(); break
     for ln in lines:
         m = re.search(r"^FECHA[:\s]+(.+)$", ln, flags=re.I)
         if m:
-            fecha_raw = m.group(1).strip()
-            break
-
-    # Fecha → ISO si es posible
+            fecha_raw = m.group(1).strip(); break
     fecha_iso = None
     if fecha_raw:
-        meses = {
-            "enero": "01", "febrero": "02", "marzo": "03", "abril": "04", "mayo": "05", "junio": "06",
-            "julio": "07", "agosto": "08", "septiembre": "09", "setiembre": "09", "octubre": "10",
-            "noviembre": "11", "diciembre": "12"
-        }
+        meses = {"enero":"01","febrero":"02","marzo":"03","abril":"04","mayo":"05","junio":"06",
+                 "julio":"07","agosto":"08","septiembre":"09","setiembre":"09","octubre":"10",
+                 "noviembre":"11","diciembre":"12"}
         mm = re.search(r"(\d{1,2})\s+de\s+([A-Za-záéíóúñ]+)\s+de\s+(\d{4})", fecha_raw, flags=re.I)
         if mm:
             d, mes_txt, y = mm.group(1), mm.group(2).lower(), mm.group(3)
@@ -263,40 +266,29 @@ def parse_header_text_lines(lines: List[str]) -> Dict[str, Any]:
                     fecha_iso = f"{y}-{mes}-{int(d):02d}"
                 except Exception:
                     fecha_iso = None
-
     return {"ORGANIZADOR": org, "LUGAR": lugar, "FECHA": fecha_iso or fecha_raw}
 
 def parse_header_from_words(page) -> Dict[str, Any]:
-    """
-    Fallback cuando el texto está solapado: usa extract_words y agrupa por línea (y).
-    Construye líneas ordenadas por x y reutiliza parse_header_text_lines.
-    """
     try:
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
     except Exception:
         words = []
     if not words:
         return {"ORGANIZADOR": None, "LUGAR": None, "FECHA": None}
-
-    # Agrupa por línea con tolerancia vertical
     lines_map = {}
     for w in words:
         top = w.get("top", 0.0)
-        line_key = round(float(top), 1)  # agrupa por top aproximado
+        line_key = round(float(top), 1)
         lines_map.setdefault(line_key, []).append(w)
-
-    # Ordena por Y (de arriba a abajo) y por X dentro de cada línea
     ordered_lines = []
     for k in sorted(lines_map.keys()):
         ws = sorted(lines_map[k], key=lambda d: d.get("x0", 0.0))
         txt = " ".join([norm_ws(w.get("text", "")) for w in ws if w.get("text")])
         if txt.strip():
             ordered_lines.append(txt.strip())
-
     return parse_header_text_lines(ordered_lines)
 
 def parse_header(page) -> Dict[str, Any]:
-    """Primero intenta con extract_text(); si falla ORGANIZADOR, cae a palabras."""
     try:
         raw_text = page.extract_text() or ""
     except Exception:
@@ -304,66 +296,45 @@ def parse_header(page) -> Dict[str, Any]:
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines() if ln.strip()]
     header = parse_header_text_lines(lines)
     if not header.get("ORGANIZADOR"):
-        # Fallback por solapado
         header2 = parse_header_from_words(page)
-        # Completa solo lo que falte
         for k in ("ORGANIZADOR", "LUGAR", "FECHA"):
             if not header.get(k) and header2.get(k):
                 header[k] = header2[k]
     return header
 
 # ----------------- Extracción principal -----------------
-def detect_scores_and_clean(df: pd.DataFrame) -> pd.DataFrame:
-    df = detect_scores(df)
-    keys = [c for c in ["Nº LIC.", "EJEMPLAR", "CLUB"] if c in df.columns]
-    if keys:
-        df = df.dropna(how="all", subset=keys)
-    for c in ["AGI_PEN", "AGI_VEL", "JMP_PEN", "JMP_VEL"]:
-        if c in df.columns:
-            df[c] = df[c].map(spanish_num)
-    df["ELIM_AGI"] = df["AGI_PEN"].isna() & df["AGI_VEL"].apply(lambda v: (str(v) if v is not None else "") != "")
-    df["ELIM_JMP"] = df["JMP_PEN"].isna() & df["JMP_VEL"].apply(lambda v: (str(v) if v is not None else "") != "")
-    for c in ["CATEGORIA", "Nº LIC.", "GRADO", "EJEMPLAR", "LOE / RRC", "CLUB"]:
-        if c not in df.columns:
-            df[c] = None
-    df = df[[c for c in FINAL_ORDER if c in df.columns] + [c for c in df.columns if c not in FINAL_ORDER]]
-    return df.reset_index(drop=True)
+def extract_tables_from_page(page) -> List[pd.DataFrame]:
+    """Dos pasadas: líneas y auto."""
+    dfs: List[pd.DataFrame] = []
+    # PASS 1: líneas
+    try:
+        tables = page.extract_tables(table_settings=TABLE_SETTINGS_LINES)
+    except Exception:
+        tables = []
+    for tb in (tables or []):
+        df = clean_table(tb)
+        if not df.empty:
+            dfs.append(df)
+    # PASS 2: auto (si no hubo tablas útiles)
+    if not dfs:
+        try:
+            tables2 = page.extract_tables()
+        except Exception:
+            tables2 = []
+        for tb in (tables2 or []):
+            df = clean_table(tb)
+            if not df.empty:
+                dfs.append(df)
+    return dfs
 
 def extract_pdf(pdf_path: Path, year: str) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     with pdfplumber.open(pdf_path) as pdf:
         for p, page in enumerate(pdf.pages, 1):
             header = parse_header(page)
-
-            try:
-                tables = page.extract_tables()
-            except Exception:
-                tables = []
-
-            for tb in tables:
-                # tabla → dataframe (cabeceras robustas)
-                if not tb:
-                    continue
-                rows = [[norm_ws(c) for c in r] for r in tb]
-                rows = [r for r in rows if any(str(x or "").strip() for x in r)]
-                if not rows:
-                    continue
-
-                if is_header_row(rows[0]):
-                    cols = canon_headers([str(x or "") for x in rows[0]])
-                    body = rows[1:]
-                else:
-                    width = max(len(r) for r in rows)
-                    cols = make_unique([""] * width)
-                    body = [r + [""] * (len(cols) - len(r)) for r in rows]
-
-                df = pd.DataFrame(body, columns=cols)
-                df = df.loc[:, df.notna().any(axis=0)]
-                df.columns = canon_headers(list(df.columns))
-                df = detect_scores_and_clean(df)
-                if df.empty:
-                    continue
-
+            dfs = extract_tables_from_page(page)
+            print(f"[p{p:02d}] tablas detectadas: {len(dfs)}")
+            for df in dfs:
                 df["AÑO"] = int(year)
                 df["PAGINA"] = p
                 df["ORGANIZADOR"] = header.get("ORGANIZADOR")
@@ -375,19 +346,15 @@ def extract_pdf(pdf_path: Path, year: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     final = pd.concat(frames, ignore_index=True, sort=False)
-
-    # Elimina columnas Col_* totalmente vacías
+    # Limpia Col_* vacías
     for c in list(final.columns):
         if c.startswith("Col_"):
             serie = final[c]
             if (serie.isna() | (serie.astype(str).str.strip() == "")).all():
                 final = final.drop(columns=[c])
-
-    # Deduplicados evidentes
     subset = [x for x in ["AÑO", "PAGINA", "Nº LIC.", "EJEMPLAR", "AGI_PEN", "JMP_PEN"] if x in final.columns]
     if subset:
         final = final.drop_duplicates(subset=subset, keep="first")
-
     return final
 
 def save_json_records(df: pd.DataFrame, out_path: Path):
@@ -399,7 +366,6 @@ def save_json_records(df: pd.DataFrame, out_path: Path):
             if c.startswith("Col_"):
                 df[c] = df[c].map(lambda x: None if (isinstance(x, str) and x.strip() == "") else x)
         records = df.to_dict(orient="records")
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2, allow_nan=False)
