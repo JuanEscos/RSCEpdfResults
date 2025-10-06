@@ -74,7 +74,7 @@ jobs:
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/RSCE/data"
           curl --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
 
       - name: Subir JSONs por FTPS (TLS explícito en 21)
@@ -85,7 +85,7 @@ jobs:
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/RSCE/data"
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             NAME="$(basename "$f")"
@@ -104,7 +104,7 @@ jobs:
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ResultadosRSCE/data"
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/RSCE/data"
           : > remote_hashes.txt
           while IFS= read -r f; do
             [ -n "$f" ] || continue
