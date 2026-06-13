@@ -1,5 +1,6 @@
 name: RSCE Resultados diarios (PDF→JSON + FTPS)
 
+
 on:
   schedule:
     - cron: '10 4 * * *'   # 04:10 UTC
