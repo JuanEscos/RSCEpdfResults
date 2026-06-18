@@ -66,6 +66,16 @@ jobs:
           done
           echo "count=${#FILES[@]}" >> "$GITHUB_OUTPUT"
 
+      - name: Upload artifacts backup antes de FTP
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsce-resultados-json-${{ github.run_number }}
+          path: |
+            data/agility/processed/resultados_*.json
+            local_files.txt
+            local_hashes.txt
+          retention-days: 10
+
       - name: Listar carpeta remota antes de subir
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
