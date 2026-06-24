@@ -1,4 +1,4 @@
-name: RSCE Resultados diarios (PDF→JSON + FTPS)
+name: RSCE Resultados diarios PDF JSON SFTP
 
 on:
   schedule:
@@ -8,17 +8,24 @@ on:
 jobs:
   run-and-upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     env:
       TZ: Europe/Madrid
       PY_SCRIPT: rsce_agility_pdf_to_json.py
       OUT_DIR: data/agility/processed
       FILE_PATTERN: 'resultados_*.json'
-      # Cambia a 'true' SOLO si el servidor sigue fallando con la cadena TLS
       ALLOW_INSECURE_SSL: 'false'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Mostrar IP pública del runner
+        run: |
+          echo "IP pública del runner GitHub Actions:"
+          curl -s https://api.ipify.org
+          echo ""
 
       - name: Refresh CA certificates
         run: |
@@ -39,13 +46,13 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Asegura certifi disponible para el script
+
           python - << 'PY'
           import certifi, sys
           print("certifi.where() =", certifi.where(), file=sys.stderr)
           PY
 
-      - name: Run scraper (PDF → JSON por año)
+      - name: Run scraper PDF to JSON por año
         run: |
           set -euo pipefail
           python "$PY_SCRIPT"
@@ -54,85 +61,148 @@ jobs:
         id: collect
         run: |
           set -euo pipefail
-          test -d "$OUT_DIR" || { echo "No existe $OUT_DIR"; exit 1; }
+
+          test -d "$OUT_DIR" || { echo "❌ No existe $OUT_DIR"; exit 1; }
+
           mapfile -t FILES < <(find "$OUT_DIR" -type f -name "$FILE_PATTERN" | sort)
+
           if [ ${#FILES[@]} -eq 0 ]; then
-            echo "No hay JSONs que subir"; exit 1
+            echo "❌ No hay JSONs que subir"
+            exit 1
           fi
+
           printf "%s\n" "${FILES[@]}" > local_files.txt
+
           : > local_hashes.txt
+
           for f in "${FILES[@]}"; do
             sha256sum "$f" >> local_hashes.txt
           done
+
           echo "count=${#FILES[@]}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifacts backup antes de FTP
+          echo "Archivos encontrados:"
+          cat local_files.txt
+
+          echo "Hashes locales:"
+          cat local_hashes.txt
+
+      - name: Upload artifacts backup antes de SFTP
         uses: actions/upload-artifact@v4
         with:
-          name: rsce-resultados-json-${{ github.run_number }}
+          name: rsce-resultados-json-pre-sftp-${{ github.run_number }}
           path: |
             data/agility/processed/resultados_*.json
             local_files.txt
             local_hashes.txt
           retention-days: 10
 
-      - name: Listar carpeta remota antes de subir
-        env:
-          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+      - name: Instalar cliente SFTP
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/RSCE/data"
-          curl --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
+          sudo apt-get update
+          sudo apt-get install -y lftp
 
-      - name: Subir JSONs por FTPS con reintentos
+      - name: Listar carpeta remota por SFTP antes de subir
         env:
-          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+          FTP_SERVER:   ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
         run: |
           set -euo pipefail
 
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/RSCE/data"
+          if [ -z "$FTP_SERVER" ] || [ -z "$FTP_USERNAME" ] || [ -z "$FTP_PASSWORD" ]; then
+            echo "❌ Variables SFTP no configuradas correctamente"
+            exit 1
+          fi
+
+          REMOTE_DIR="www/NewWeb/Privado/Competiciones/RSCE/data"
+
+          echo "Listando carpeta remota:"
+          echo "$REMOTE_DIR"
+
+          timeout 120 lftp -u "${FTP_USERNAME},${FTP_PASSWORD}" "sftp://${FTP_SERVER}:22" -e "\
+            set cmd:fail-exit yes; \
+            set net:timeout 30; \
+            set net:max-retries 1; \
+            set net:reconnect-interval-base 10; \
+            set sftp:auto-confirm yes; \
+            set sftp:connect-program 'ssh -a -x -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=2'; \
+            pwd; \
+            cd ${REMOTE_DIR}; \
+            pwd; \
+            cls -l; \
+            bye"
+
+      - name: Subir JSONs por SFTP SSH 22
+        id: sftp_upload
+        env:
+          FTP_SERVER:   ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$FTP_SERVER" ] || [ -z "$FTP_USERNAME" ] || [ -z "$FTP_PASSWORD" ]; then
+            echo "❌ Variables SFTP no configuradas correctamente"
+            exit 1
+          fi
+
+          REMOTE_DIR="www/NewWeb/Privado/Competiciones/RSCE/data"
+
+          echo "Subiendo por SFTP:"
+          echo "Servidor: ${FTP_SERVER}"
+          echo "Puerto: 22"
+          echo "Ruta remota: ${REMOTE_DIR}"
 
           upload_with_retries() {
             local FILE="$1"
             local NAME="$2"
 
+            echo ""
+            echo "===================================================="
+            echo "Archivo local: ${FILE}"
+            echo "Archivo remoto: ${NAME}"
+            echo "===================================================="
+
+            if [ ! -f "$FILE" ]; then
+              echo "❌ No existe el archivo local: $FILE"
+              return 1
+            fi
+
             for attempt in 1 2 3 4 5; do
-              echo "→ Subiendo ${NAME} intento ${attempt}/5"
+              echo "→ Subiendo ${NAME} por SFTP intento ${attempt}/5"
 
               set +e
-              curl --fail \
-                   --ssl-reqd \
-                   --ftp-create-dirs \
-                   --disable-epsv \
-                   --ftp-skip-pasv-ip \
-                   --connect-timeout 60 \
-                   --max-time 300 \
-                   --retry 5 \
-                   --retry-delay 20 \
-                   --retry-max-time 300 \
-                   --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-                   --upload-file "$FILE" \
-                   "${BASE}/${NAME}"
-
+              timeout 180 lftp -u "${FTP_USERNAME},${FTP_PASSWORD}" "sftp://${FTP_SERVER}:22" -e "\
+                set cmd:fail-exit yes; \
+                set net:timeout 30; \
+                set net:max-retries 1; \
+                set net:reconnect-interval-base 10; \
+                set sftp:auto-confirm yes; \
+                set sftp:connect-program 'ssh -a -x -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=2'; \
+                pwd; \
+                cd ${REMOTE_DIR}; \
+                pwd; \
+                put ${FILE} -o ${NAME}; \
+                bye"
               rc=$?
               set -e
 
               if [ "$rc" -eq 0 ]; then
-                echo "✅ Subido correctamente: ${NAME}"
+                echo "✅ Subido correctamente por SFTP: ${NAME}"
                 return 0
               fi
 
-              echo "⚠️ Falló la subida de ${NAME}. Código curl: ${rc}"
+              if [ "$rc" -eq 124 ]; then
+                echo "⚠️ Timeout: el intento SFTP se quedó colgado y fue cancelado automáticamente"
+              else
+                echo "⚠️ Falló la subida de ${NAME}. Código: ${rc}"
+              fi
 
               if [ "$attempt" -lt 5 ]; then
-                echo "Esperando 60 segundos antes de reintentar..."
-                sleep 60
+                echo "Esperando 30 segundos antes de reintentar..."
+                sleep 30
               fi
             done
 
@@ -146,33 +216,85 @@ jobs:
             upload_with_retries "$f" "$NAME"
           done < local_files.txt
 
-      - name: Verificar subidas (descarga y compara hash)
+      - name: Verificar subidas por SFTP descarga y compara hash
+        if: steps.sftp_upload.outcome == 'success'
         env:
-          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+          FTP_SERVER:   ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/RSCE/data"
+
+          REMOTE_DIR="www/NewWeb/Privado/Competiciones/RSCE/data"
+
           : > remote_hashes.txt
+
+          download_with_retries() {
+            local NAME="$1"
+
+            for attempt in 1 2 3 4 5; do
+              echo "← Descargando ${NAME} por SFTP intento ${attempt}/5"
+
+              set +e
+              timeout 180 lftp -u "${FTP_USERNAME},${FTP_PASSWORD}" "sftp://${FTP_SERVER}:22" -e "\
+                set cmd:fail-exit yes; \
+                set net:timeout 30; \
+                set net:max-retries 1; \
+                set net:reconnect-interval-base 10; \
+                set sftp:auto-confirm yes; \
+                set sftp:connect-program 'ssh -a -x -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=2'; \
+                pwd; \
+                cd ${REMOTE_DIR}; \
+                pwd; \
+                get ${NAME} -o remote_${NAME}; \
+                bye"
+              rc=$?
+              set -e
+
+              if [ "$rc" -eq 0 ]; then
+                echo "✅ Descargado correctamente: ${NAME}"
+                return 0
+              fi
+
+              if [ "$rc" -eq 124 ]; then
+                echo "⚠️ Timeout descargando ${NAME}"
+              else
+                echo "⚠️ Falló la descarga de ${NAME}. Código: ${rc}"
+              fi
+
+              if [ "$attempt" -lt 5 ]; then
+                echo "Esperando 30 segundos antes de reintentar..."
+                sleep 30
+              fi
+            done
+
+            echo "❌ No se pudo descargar ${NAME} después de 5 intentos"
+            return 1
+          }
+
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             NAME="$(basename "$f")"
-            echo "← Descargando $NAME para verificar"
-            curl --fail --ssl-reqd --disable-epsv --ftp-skip-pasv-ip \
-                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-                 --output "remote_${NAME}" \
-                 "${BASE}/${NAME}"
+
+            download_with_retries "$NAME"
             sha256sum "remote_${NAME}" >> remote_hashes.txt
           done < local_files.txt
+
+          echo "Hashes locales:"
+          awk '{print $1}' local_hashes.txt
+
+          echo "Hashes remotos:"
+          awk '{print $1}' remote_hashes.txt
+
           diff -q <(awk '{print $1}' local_hashes.txt) <(awk '{print $1}' remote_hashes.txt)
+
           echo "✔ Hash de todos los JSONs OK"
 
-      - name: Upload artifacts backup
+      - name: Upload artifacts final
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rsce-resultados-json-${{ github.run_number }}
+          name: rsce-resultados-json-final-${{ github.run_number }}
           path: |
             data/agility/processed/resultados_*.json
             local_files.txt
