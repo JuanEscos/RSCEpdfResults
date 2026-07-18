@@ -13,23 +13,108 @@ RSCE Agility → PDFs a JSON por año
 - JSON estricto (sin NaN)
 """
 
-import os, re, json, shlex, subprocess
+import os, re, json, shlex, subprocess, datetime
 from pathlib import Path
 from typing import List, Any, Dict, Optional
 import numpy as np
 import pandas as pd
 import requests, pdfplumber, certifi
 
-# ----------------- Config -----------------
-URLS = {
-    "2025": "https://www.rsce.es/wp-content/uploads/2025/09/Resultados_Agility_2025.pdf"
+#
+# RSCE publica el resumen PDF bajo:
+#   https://www.rsce.es/wp-content/uploads/{PUB_YEAR}/{PUB_MONTH:02d}/Resultados_Agility_{DATA_YEAR}.pdf
+#
+# Patrón histórico observado:
+#   2022 → /2024/11/Resultados_Agility_2022.pdf
+#   2023 → /2024/11/Resultados_Agility_2023.pdf
+#   2024 → /2025/09/Resultados_Agility_2024.pdf   (confirmado)
+#   2025 → /2025/09/Resultados_Agility_2025.pdf   (confirmado)
+#   2026 → desconocido, se probará automáticamente
 
+# URLs confirmadas (estas se usan directamente, sin probe):
+KNOWN_URLS: Dict[str, str] = {
+    "2022": "https://www.rsce.es/wp-content/uploads/2024/11/Resultados_Agility_2022.pdf",
+    "2023": "https://www.rsce.es/wp-content/uploads/2024/11/Resultados_Agility_2023.pdf",
+    "2024": "https://www.rsce.es/wp-content/uploads/2025/09/Resultados_Agility_2024.pdf",
+    "2025": "https://www.rsce.es/wp-content/uploads/2025/09/Resultados_Agility_2025.pdf",
 }
 
-    # "2024": "https://www.rsce.es/wp-content/uploads/2025/09/Resultados_Agility_2024.pdf",
-    # "2023": "https://www.rsce.es/wp-content/uploads/2024/11/Resultados_Agility_2023.pdf",
-    # "2022": "https://www.rsce.es/wp-content/uploads/2024/11/Resultados_Agility_2022.pdf",
-    
+# Años que se procesarán en cada ejecución (ajustar según necesidad)
+# Por defecto: solo el año actual y el anterior para no procesar todo el histórico cada día
+_today = datetime.date.today()
+ACTIVE_YEARS = [str(_today.year - 1), str(_today.year)]   # ej: ["2025", "2026"]
+
+
+def probe_url(url: str, timeout: int = 15) -> bool:
+    """Comprueba si una URL devuelve un PDF válido (%PDF en los primeros bytes)."""
+    UA = "Mozilla/5.0 (RSCE-Agility-Scraper/2.0)"
+    try:
+        r = requests.head(url, headers={"User-Agent": UA}, timeout=timeout, allow_redirects=True)
+        if r.status_code != 200:
+            return False
+        ct = r.headers.get("Content-Type", "")
+        if "pdf" in ct.lower():
+            return True
+        # HEAD no siempre devuelve Content-Type correcto → comprobamos con GET parcial
+        r2 = requests.get(url, headers={"User-Agent": UA, "Range": "bytes=0-3"},
+                          timeout=timeout, stream=True)
+        first4 = next(r2.iter_content(4), b"")
+        return first4 == b"%PDF"
+    except Exception:
+        return False
+
+
+def build_candidate_urls(year: str) -> List[str]:
+    """
+    Genera todas las URLs candidatas para el PDF de `year`,
+    ordenadas de más a menos probable según el patrón histórico de RSCE.
+    RSCE publica los resultados meses o incluso años después.
+    """
+    yr = int(year)
+    candidates = []
+    # Probamos pub_year desde el mismo año hasta 2 años después, meses de septiembre a enero
+    for pub_yr in range(yr, yr + 3):
+        for pub_mo in [9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8]:
+            url = (
+                f"https://www.rsce.es/wp-content/uploads/"
+                f"{pub_yr}/{pub_mo:02d}/Resultados_Agility_{year}.pdf"
+            )
+            candidates.append(url)
+    return candidates
+
+
+def resolve_urls(active_years: List[str]) -> Dict[str, str]:
+    """
+    Para cada año activo:
+     1. Si hay URL conocida → úsala directamente.
+     2. Si no → prueba candidatas en orden hasta encontrar una que responda.
+    Devuelve solo los años para los que se encontró URL.
+    """
+    result: Dict[str, str] = {}
+    for year in active_years:
+        if year in KNOWN_URLS:
+            print(f"[cfg] {year} → URL conocida: {KNOWN_URLS[year]}")
+            result[year] = KNOWN_URLS[year]
+        else:
+            print(f"[probe] Buscando URL para {year}...")
+            found = False
+            for url in build_candidate_urls(year):
+                print(f"  → probando {url}", end=" ", flush=True)
+                if probe_url(url):
+                    print("✓ ENCONTRADA")
+                    result[year] = url
+                    found = True
+                    break
+                else:
+                    print("✗")
+            if not found:
+                print(f"  ⚠  No se encontró PDF para {year} (aún no publicado)")
+    return result
+
+
+# Construir el diccionario final URLS que usará el main()
+URLS = resolve_urls(ACTIVE_YEARS)
+
 BASE = Path(".").resolve()
 RAW = BASE / "data" / "agility" / "raw"
 OUT = BASE / "data" / "agility" / "processed"
