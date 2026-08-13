@@ -1,0 +1,50 @@
+name: Limpiar ejecuciones completadas
+
+on:
+  schedule:
+    - cron: '30 4 * * *' # Diariamente, 04:30 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Borrar ejecuciones completadas con más de 5 días
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const retentionDays = 5;
+            const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+            let page = 1;
+            let deleted = 0;
+
+            while (true) {
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                status: 'completed',
+                per_page: 100,
+                page,
+              });
+
+              for (const run of data.workflow_runs) {
+                const created_at = new Date(run.created_at);
+                if (created_at < cutoff) {
+                  await github.request('DELETE /repos/{owner}/{repo}/actions/runs/{run_id}', {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: run.id,
+                  });
+                  core.info(`Eliminada ejecución ${run.id} (${run.name}, ${run.created_at})`);
+                  deleted++;
+                }
+              }
+
+              if (data.workflow_runs.length < 100) break;
+              page++;
+            }
+
+            core.info(`Limpieza completada: ${deleted} ejecuciones eliminadas; conservación: últimos ${retentionDays} días.`);
